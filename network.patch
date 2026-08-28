@@ -1,0 +1,171 @@
+--- a/Panel.qml
++++ b/Panel.qml
+@@ -318,6 +318,7 @@
+   // KeyboardPanel primes layer-shell focus whenever the panel opens. That's
+   // what makes the SUPER+CTRL+W keybind land here with navigation ready.
+   onOpenedChanged: {
++    if (opened && kind === "wifi") connectivityRecheck.restart()
+     if (opened) {
+       refresh(true)
+       selectedIndex = wifiNetworks.length > 0 ? 0 : -1
+@@ -427,6 +428,7 @@
+     // Only act on a row that still resolves. disconnect() falls back to
+     // connectedWifiNetwork when handed null, so a row left stale by scan churn
+     // would otherwise tear down whatever is connected now instead.
++    if (net.connected && portalDetected) { openPortal(); return }
+     if (net.connected) { disconnectRow(net.ssid); return }
+     if (requiresCredentials(net.security) && !net.known) { openPasswordPrompt(net.ssid); return }
+     connectDirectly(net.ssid)
+@@ -450,7 +452,68 @@
+     Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(value) + " | wl-copy"])
+   }
+ 
+-  readonly property string icon: Model.connectionIcon(kind, signalStrength)
++  // portal-pop: NetworkManager connectivity ("full" | "portal" | "limited" | "none" | "unknown").
++  // Quickshell.Networking doesn't expose it, so poll nmcli slowly while on wifi.
++  property string connectivity: "full"
++  readonly property bool portalDetected: kind === "wifi" && connectivity === "portal"
++  onConnectedWifiNetworkChanged: connectivityRecheck.restart()
++
++  Process {
++    id: connectivityProc
++    // NM alone misses some portals (Starbucks reports "full" while blocked),
++    // so when it says full, confirm with one tiny http probe.
++    command: ["bash", "-c",
++      "[ -e /tmp/portal-test ] && { echo portal; exit; }; " +
++      "c=$(nmcli -g CONNECTIVITY general 2>/dev/null); " +
++      "if [ \"$c\" = full ]; then " +
++      "r=$(curl -s -m 4 -o /dev/null -w '%{http_code} %{redirect_url}' http://ping.archlinux.org); " +
++      "case \"$r\" in '200 ') echo full;; '000 ') echo none;; *) echo portal;; esac; " +
++      "else echo \"${c:-unknown}\"; fi"]
++    stdout: StdioCollector {
++      waitForEnd: true
++      onStreamFinished: root.connectivity = String(text).trim() || "unknown"
++    }
++  }
++  // Event-driven, no idle polling (phones probe on connect, not forever):
++  // - burst after a wifi connection comes up (NM needs a few seconds to settle)
++  // - once each time the panel is opened
++  // - every 20s after the user opens the portal, until we're online
++  Timer {
++    id: connectivityRecheck
++    interval: 3000
++    repeat: false
++    onTriggered: { if (!connectivityProc.running) connectivityProc.running = true; connectBurst.restart() }
++  }
++  Timer {
++    id: connectBurst
++    property int step: 0
++    interval: 7000
++    repeat: true
++    onRunningChanged: if (running) step = 0
++    onTriggered: {
++      step += 1
++      if (!connectivityProc.running) connectivityProc.running = true
++      if (step >= 2) stop()   // 3s, 10s, 17s after connect — then quiet
++    }
++  }
++  function openPortal() {
++    Quickshell.execDetached(["bash", "-c", Model.openPortalScript])
++    portalRecheck.start()
++  }
++  Timer {
++    id: portalRecheck
++    interval: 20000
++    repeat: true
++    // Ask NM to re-probe while the user signs in; stops once we're online.
++    running: false
++    onTriggered: {
++      if (!root.portalDetected) { stop(); return }
++      Quickshell.execDetached(["nmcli", "networking", "connectivity", "check"])
++      connectivityRecheck.restart()
++    }
++  }
++
++  readonly property string icon: Model.connectionIcon(kind, signalStrength, connectivity)
+ 
+   // The share card is its own panel plugin (omarchy.wifiqr) so a replacement
+   // design can take it over; summon() routes to whichever implementation is
+@@ -1192,6 +1255,7 @@
+             width: parent.width
+             text: {
+               if (root.info.type === "wifi") {
++                if (root.portalDetected) return "SIGN-IN REQUIRED"
+                 if (root.canDisconnect) return root.connectionPhrase.toUpperCase()
+                 if (root.kind === "disconnected") return "NOT CONNECTED"
+                 return ""
+@@ -1651,6 +1715,7 @@
+       if (isBusy && root.actionKind === "disconnect") return "Disconnecting…"
+       if (isBusy && root.actionKind === "forget") return "Forgetting…"
+       if (isFailed) return root.failureReason || "Failed"
++      if (isConnected && root.portalDetected) return "Sign-in required · click to open portal"
+       if (isConnected) return "Connected"
+       return ""
+     }
+@@ -1658,6 +1723,7 @@
+     readonly property color statusColor: {
+       if (isFailed) return root.bar.urgent
+       if (isBusy) return root.bar.foreground
++      if (isConnected && root.portalDetected) return root.bar.urgent
+       if (isConnected) return root.bar.foreground
+       return Qt.darker(root.bar.foreground, 1.5)
+     }
+@@ -1688,6 +1754,10 @@
+         root.focusSection = "wifi"
+         root.selectedIndex = row.index
+         root.wifiActionFocused = false
++        if (row.isConnected && root.portalDetected) {
++          root.openPortal()
++          return
++        }
+         if (row.isConnected) {
+           root.disconnectRow(row.net.ssid)
+           return
+@@ -1711,8 +1781,8 @@
+ 
+       Text {
+         id: networkIcon
+-        text: row.net ? root.wifiIconFor(row.net.signal) : ""
+-        color: row.statusColor
++        text: row.net ? (row.isConnected && root.portalDetected ? "󰤪" : root.wifiIconFor(row.net.signal)) : ""
++        color: row.isConnected && root.portalDetected ? root.bar.foreground : row.statusColor
+         font.family: root.bar.fontFamily
+         font.pixelSize: Style.font.title
+         anchors.left: parent.left
+--- a/Model.js
++++ b/Model.js
+@@ -14,7 +14,9 @@
+   return icons[index]
+ }
+ 
+-function connectionIcon(kind, signalStrength) {
++function connectionIcon(kind, signalStrength, connectivity) {
++  // portal-pop: locked wifi icon when NM says we're behind a captive portal or have no route out.
++  if (kind === "wifi" && (connectivity === "portal" || connectivity === "limited" || connectivity === "none")) return "󰤪"
+   if (kind === "wifi") return wifiIconFor(signalStrength)
+   if (kind === "ethernet") return "󰈀"
+   return "󰤮"
+@@ -316,6 +318,15 @@
+ // `connection edit` editor -- argv is world-readable in /proc, so the secret
+ // must never be an argument (printf is a bash builtin, so no process spawns
+ // with it either).
++// portal-pop: probe a plain-http URL, open whatever the portal redirects to (what phones do).
++// No redirect = no portal; say so instead of opening the bait page.
++var openPortalScript =
++  "u=$(curl -s -m 5 -o /dev/null -w '%{redirect_url}' http://ping.archlinux.org);" +
++  " case \"$u\" in" +
++  "   http://*|https://*) xdg-open \"$u\" ;;" +
++  "   *) omarchy-notification-send --app-name Wi-Fi -g 󰤬 -t 5000 'No sign-in page' 'This network is already online.' ;;" +
++  " esac"
++
+ var enterpriseConnectScript =
+   "u=$(uuidgen); IFS= read -r pw;" +
+   " nmcli connection add type wifi con-name \"$1\" ssid \"$1\" connection.uuid \"$u\"" +
+@@ -374,6 +385,7 @@
+     requiresCredentials: requiresCredentials,
+     canForgetNetwork: canForgetNetwork,
+     enterpriseConnectScript: enterpriseConnectScript,
++    openPortalScript: openPortalScript,
+     networkFailureReason: networkFailureReason,
+     shouldRepromptPassphrase: shouldRepromptPassphrase
+   }
