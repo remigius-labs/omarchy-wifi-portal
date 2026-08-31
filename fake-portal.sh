@@ -7,7 +7,9 @@ set -euo pipefail
 
 HOST=ping.archlinux.org
 MARK="# omarchy-wifi-portal fake"
-PID=/tmp/fake-portal.pid
+# Owner-only runtime dir — a PID file in shared /tmp could be swapped by
+# another local user before the privileged kill in off().
+PID="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fake-portal.pid"
 
 on() {
   grep -q "$MARK" /etc/hosts || echo "127.0.0.1 $HOST $MARK" | sudo tee -a /etc/hosts >/dev/null
@@ -34,8 +36,16 @@ PY
 }
 
 off() {
-  [ -f "$PID" ] && sudo kill "$(cat "$PID")" 2>/dev/null; rm -f "$PID"
-  sudo pkill -f 'TCPServer(("127.0.0.1", 80)' 2>/dev/null || true
+  if [ -f "$PID" ]; then
+    pid=$(cat "$PID")
+    # Confirm the PID is still our sudo→python3 wrapper before signaling —
+    # guards against PID recycling.
+    if [[ "$pid" =~ ^[0-9]+$ ]] \
+      && tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q '^sudo python3 -'; then
+      sudo kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID"
+  fi
   sudo sed -i "/$MARK/d" /etc/hosts
   echo "Fake portal OFF."
 }
