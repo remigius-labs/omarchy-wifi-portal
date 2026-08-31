@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "remi.wifi-portal",
+  "name": "Wi-Fi Portal",
+  "version": "1.1.0",
+  "author": "remigius-labs",
+  "description": "Network widget that detects captive portals — lock icon in the bar, red 'Sign-in required' row in the panel, click to open the sign-in page. Like your phone does.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Wi-Fi Portal",
+    "description": "Wi-Fi list and connection state, with captive portal detection",
+    "category": "Network",
+    "allowMultiple": false
+  }
+}
