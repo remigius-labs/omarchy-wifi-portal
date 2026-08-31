@@ -49,19 +49,6 @@ omarchy plugin remove remi.wifi-portal
 omarchy plugin enable omarchy.network
 ```
 
-## Test it at home
-
-No café needed. `fake-portal.sh` makes your own laptop behave like a café router:
-every http request gets hijacked and sent to a fake "Café Wi-Fi" sign-in page.
-
-```bash
-./fake-portal.sh on   # your laptop now acts captive
-./fake-portal.sh off  # back to normal
-```
-
-Points `ping.archlinux.org` at a tiny local http server via `/etc/hosts`; needs
-sudo; fully reverted by `off`.
-
 ## Credits
 
 Derived from Omarchy's built-in `omarchy.network` plugin (MIT). No external
